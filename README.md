@@ -4,6 +4,10 @@
 
 一个轻量的 macOS 原生 SFTP 文件浏览器。Swift + AppKit，无第三方运行时依赖。
 
+![RemoteFinder 运行截图：青绿色侧边栏、逐级目录导航和文件列表](docs/images/remotefinder.jpg)
+
+*实际运行界面，使用本地 SFTP 演示数据；连接名称和文件均为示例。*
+
 ## 启动
 
 ```sh

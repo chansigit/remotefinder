@@ -1,0 +1,11 @@
+.build/
+dist/
+.DS_Store
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.ssh/

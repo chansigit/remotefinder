@@ -8,7 +8,15 @@
 
 *实际运行界面，使用本地 SFTP 演示数据；连接名称和文件均为示例。*
 
-## 启动
+## 下载与安装
+
+**[下载最新 macOS 安装包](https://github.com/chansigit/remotefinder/releases/latest)** · **[安装与权限指南](docs/INSTALL.md)**
+
+下载 `RemoteFinder-版本号-macOS-universal.dmg`，打开后将应用拖到 `Applications`，再从「应用程序」启动。支持 macOS 11+，同一个安装包包含 Apple Silicon 和 Intel 两种架构；无需安装开发工具。另有 ZIP 备用包。
+
+当前版本尚未进行 Developer ID 签名和 Apple 公证。如果首次打开被系统拦截，请先确认下载来源，再按[首次启动说明](docs/INSTALL.md)操作。正常使用无需开启完整磁盘访问、辅助功能或屏幕录制权限。
+
+## 从源码构建
 
 ```sh
 git clone https://github.com/chansigit/remotefinder.git
@@ -60,6 +68,10 @@ bash scripts/test.sh
 测试使用本机 `/usr/libexec/sftp-server` 和一个 Python 标准库测试服务，不连接外部服务器。覆盖参数校验、二进制协议解析、1,207 个目录项、中文/空格/换行/特殊字符文件名、符号链接、2 MiB 下载内容比对、空文件、错误恢复、取消阻塞、短读及乱序下载响应，以及收藏持久化、收藏改名、目录路径更新、远程文件/目录/符号链接重命名和同名保护。路径栏另有交互检查，覆盖空白点击命中、逐级路径、长路径折叠、编辑提交、Esc 取消、失焦取消和忙碌时禁用。
 
 协议参考：[SFTP v3 规范草案](https://www.ietf.org/archive/id/draft-ietf-secsh-filexfer-02.txt)。SSH 认证由系统 OpenSSH 负责，未自行实现加密协议。
+
+## 构建发布包
+
+发布包可在 macOS 上通过 `bash scripts/release.sh` 构建，输出 Universal DMG、ZIP 和 SHA-256 校验文件到 `dist/releases/`。脚本会编译两个架构并检查签名及磁盘镜像完整性；不会上传文件或执行 Apple 公证。
 
 ## 开源许可
 

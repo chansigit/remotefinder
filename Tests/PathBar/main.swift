@@ -6,6 +6,12 @@ let bar = RemotePathBar(frame: NSRect(x: 0, y: 0, width: 850, height: 32))
 window.contentView!.addSubview(bar)
 let path = "/srv/example/projects/team/workspace/demo-training/experiments"
 bar.setPath(path); bar.isEnabled = true; bar.layoutSubtreeIfNeeded()
+let originalButtons = buttonsForIdentity(bar)
+func buttonsForIdentity(_ bar: RemotePathBar) -> [ObjectIdentifier] {
+    bar.subviews.flatMap { $0.subviews }.compactMap { $0 as? NSButton }.map(ObjectIdentifier.init)
+}
+bar.isEnabled = true; bar.layoutSubtreeIfNeeded()
+assert(buttonsForIdentity(bar) == originalButtons, "selection updates must not rebuild path controls")
 var navigated: String?
 bar.onNavigate = { navigated = $0 }
 func buttons() -> [NSButton] { bar.subviews.flatMap { $0.subviews }.compactMap { $0 as? NSButton } }

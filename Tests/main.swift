@@ -27,6 +27,10 @@ func test() throws {
     let arguments = try ConnectionProfile(host: "my-cluster", user: "researcher", port: "2222").arguments()
     try check(arguments.suffix(3) == ["-s", "my-cluster", "sftp"], "SSH subsystem arguments")
     try check(arguments.contains("StrictHostKeyChecking=ask"), "host identity verification")
+    try check(arguments.contains("ServerAliveInterval=15") && arguments.contains("ServerAliveCountMax=6"), "keepalive tolerates six missed responses")
+    let background = try ConnectionProfile(host: "my-cluster").arguments(interactive: false)
+    try check(background.contains("BatchMode=no") && background.contains("StrictHostKeyChecking=yes") && background.contains("NumberOfPasswordPrompts=1"), "background authentication uses guarded askpass once and rejects unknown host keys")
+    try check(arguments.contains("BatchMode=no"), "manual connections retain password authentication")
     try rejects("option injection") { _ = try ConnectionProfile(host: "-oProxyCommand=bad").arguments() }
     try rejects("shell host syntax") { _ = try ConnectionProfile(host: "a;touch pwned").arguments() }
     try rejects("invalid port") { _ = try ConnectionProfile(host: "example", port: "65536").arguments() }
@@ -93,7 +97,7 @@ func test() throws {
     let files = try server.list(canonical)
     let duration = Date().timeIntervalSince(before)
     try check(files.count == 1207, "multi-packet directory listing")
-    try check(files.first?.name == "folder", "folders first")
+    try check(try ListingWorker.project(files, query: "", showHidden: false, key: "name", ascending: true).first?.name == "folder", "folders first in displayed listing")
     try check(files.contains { $0.name == name && $0.attributes.size == UInt64(payload.count) }, "exact special filename and size")
     try check(files.contains { $0.name == "linked folder" && $0.attributes.isLink }, "link metadata")
     try check(try server.stat(source.appendingPathComponent("linked folder").path).isDirectory, "follow directory symlink")
@@ -134,6 +138,7 @@ func test() throws {
     try check(try Data(contentsOf: source.appendingPathComponent(name)) == payload, "symbolic link target preserved")
     try server.rename(in: canonical, from: "renamed link", to: "linked file")
     try check(try server.list(canonical).count == 1207, "rename errors leave session usable")
+    try check(server.isUsable, "ordinary permission and name errors preserve the connection")
     server.cancel()
     try rejects("cancelled session") { _ = try server.list(canonical) }
 
@@ -149,6 +154,36 @@ func test() throws {
     try shortServer.download("file", to: shortDestination) { _, _ in }
     let expected = Data((0..<700123).map { UInt8(truncatingIfNeeded: $0 * 31) })
     try check(try Data(contentsOf: shortDestination) == expected, "short and out-of-order pipeline responses")
+    let cancelledDownload = root.appendingPathComponent("cancelled.bin")
+    try rejects("cancel during pipelined transfer") {
+        try shortServer.download("file", to: cancelledDownload) { _, _ in shortServer.cancel() }
+    }
+    try check(!fm.fileExists(atPath: cancelledDownload.path), "cancelled download is not published")
+    try check(try fm.contentsOfDirectory(atPath: root.path).allSatisfy { !$0.hasSuffix(".partial") }, "cancelled transfer removes partial files")
+    try check(!shortServer.isUsable, "cancelled transfer cannot reuse pending responses")
+    for mode in ["disconnect", "timeout", "oversized", "truncated", "wrong-id", "relative-path", "bad-version"] {
+        let faulty = SFTPClient(serverExecutable: "/usr/bin/python3", arguments: ["Tests/fault_server.py", mode], timeout: 0.25)
+        let start = Date()
+        try rejects(mode) { try faulty.start(); _ = try faulty.realpath(".") }
+        try check(!faulty.isUsable, "\(mode) invalidates broken session")
+        try check(Date().timeIntervalSince(start) < 2, "\(mode) fails promptly")
+        faulty.cancel()
+    }
+    let excessive = SFTPClient(serverExecutable: "/usr/bin/python3", arguments: ["Tests/fault_server.py", "directory-limit"])
+    try excessive.start()
+    try rejects("unbounded directory entries") { _ = try excessive.list("/") }
+    excessive.cancel()
+    let slow = SFTPClient(serverExecutable: "/usr/bin/python3", arguments: ["Tests/fault_server.py", "fragmented"], timeout: 2)
+    try slow.start()
+    try check(try slow.realpath(".") == "/slow", "delayed fragmented reply is reconstructed")
+    slow.cancel()
+    let pidFile = root.appendingPathComponent("stubborn.pid")
+    let stubborn = SFTPClient(serverExecutable: "/usr/bin/python3", arguments: ["Tests/fault_server.py", "ignore-term", pidFile.path], timeout: 0.4)
+    try rejects("unresponsive process") { try stubborn.start() }
+    let pid = Int32(try String(contentsOf: pidFile))!
+    let killedBy = Date().addingTimeInterval(2)
+    while kill(pid, 0) == 0 && Date() < killedBy { Thread.sleep(forTimeInterval: 0.02) }
+    try check(kill(pid, 0) != 0, "stubborn child process is reaped after cancellation")
     print("PASS: \(checks) checks; real OpenSSH SFTP server; 1,207 entries in \(String(format: "%.3f", duration))s; 2 MiB exact download; short/out-of-order replies")
 }
 

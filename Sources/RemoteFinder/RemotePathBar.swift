@@ -4,8 +4,9 @@ final class RemotePathBar: NSView, NSTextFieldDelegate {
     var onNavigate: ((String) -> Void)?
     var isEnabled = false {
         didSet {
+            guard oldValue != isEnabled else { return }
             editor.isEnabled = isEnabled
-            needsLayout = true
+            for button in crumbs.subviews.compactMap({ $0 as? NSButton }) { button.isEnabled = isEnabled }
         }
     }
     private let editor = NSTextField()

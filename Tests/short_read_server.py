@@ -2,9 +2,11 @@
 import os
 import select
 import struct
+import sys
 
 SIZE = 700123
 pending = []
+max_pending = 0
 
 
 def u32(n):
@@ -42,14 +44,17 @@ try:
         kind, request_id = packet[0], packet[1:5]
         if kind == 1:
             send(2, u32(3))
-        elif kind == 17:
+        elif kind in (7, 17):
             send(105, request_id + u32(13) + struct.pack(">QIII", SIZE, 0o100600, 1, 1))
         elif kind == 3:
             send(102, request_id + string(b"file"))
         elif kind == 5:
             offset, length = struct.unpack(">QI", packet[13:25])
             pending.append((request_id, offset, length))
+            max_pending = max(max_pending, len(pending))
         elif kind == 4:
+            if "--require-pipeline" in sys.argv:
+                assert max_pending > 1, "fingerprint must pipeline READ requests"
             send(101, request_id + u32(0) + string(b"") + string(b""))
         else:
             raise AssertionError(kind)

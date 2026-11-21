@@ -1,5 +1,12 @@
 import AppKit
 import Darwin
+import UniformTypeIdentifiers
+
+private struct PromisedDownload {
+    let connection: ConnectionProfile
+    let remote: String
+    let transfers: TransferManager
+}
 
 private final class FileTable: NSTableView {
     var openSelection: (() -> Void)?
@@ -29,7 +36,11 @@ private final class FileRow: NSTableRowView {
     }
 }
 
-final class BrowserController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+final class BrowserController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSFilePromiseProviderDelegate {
+    private let promiseQueue: OperationQueue = {
+        let queue = OperationQueue(); queue.name = "RemoteFinder.filePromises"; queue.maxConcurrentOperationCount = 1
+        return queue
+    }()
     private let table = FileTable()
     private let pathBar = RemotePathBar()
     private let search = NSSearchField()
@@ -51,17 +62,61 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
     private var renameButton: NSButton!
     private var client: SFTPClient?
     private var profile: ConnectionProfile?
+    private var transferWindow: TransferWindow?
+    private var transferItems: [TransferItem] = []
+    private var transferButton: NSButton!
+    private let transferProgress = TransferProgress()
+    private lazy var transfers: TransferManager = {
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RemoteFinder/Transfers")
+        let manager = TransferManager(root: root) { connection, interactive in
+            let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+            let helper = executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/askpass")
+            return try SFTPClient(profile: connection, askpass: helper.path, interactive: interactive)
+        }
+        manager.onChange = { [weak self] items in
+            guard let self = self else { return }
+            let changed = items.filter { item in item.baseline != nil && item.baseline != self.transferItems.first(where: { $0.id == item.id })?.baseline }
+            if !changed.isEmpty { self.cache.removeAll() }
+            self.transferItems = items; self.transferWindow?.items = items
+            if !self.busy, self.client?.isUsable == true, let current = self.profile,
+               changed.contains(where: { $0.connection.sameServer(as: current) && ($0.remote as NSString).deletingLastPathComponent == self.path }) {
+                let directory = self.path
+                self.run("正在刷新上传结果…", retryRead: true) { try $0.list(directory) } completion: { [weak self] contents in
+                    guard let self = self, self.path == directory else { return }
+                    self.entries = contents; self.cache.insert(contents, at: directory); self.applyFilter()
+                }
+            }
+            let pending = items.filter { !["done", "stopped"].contains($0.state) }.count
+            let active = items.first(where: { $0.phase != nil && $0.state == "queued" }) ?? items.first(where: { $0.state == "preparing" })
+            self.transferProgress.isHidden = active == nil
+            self.transferProgress.isIndeterminate = active?.percent == nil
+            self.transferProgress.doubleValue = Double(active?.percent ?? 0)
+            if active != nil && active?.percent == nil { self.transferProgress.startAnimation(nil) }
+            else { self.transferProgress.stopAnimation(nil) }
+            let issues = items.filter { ["error", "conflict", "paused"].contains($0.state) }.count
+            let queuedCount = items.filter { ["queued", "preparing"].contains($0.state) }.count
+            self.transferButton.title = active.map { $0.progressText + " · \(queuedCount) 项" } ?? (issues > 0 ? "传输 · \(issues) 项待处理" : "传输与编辑（\(pending)）")
+            self.transferButton.toolTip = active.map { ($0.remote as NSString).lastPathComponent + "\n" + $0.detail + "\n点击查看传输面板" } ?? "查看传输、续传和本地编辑同步"
+            self.transferProgress.toolTip = self.transferButton.toolTip
+        }
+        return manager
+    }()
+
     private var path = ""
     private var home = ""
     private var entries: [RemoteEntry] = []
     private var visible: [RemoteEntry] = []
     private var backHistory: [String] = []
     private var forwardHistory: [String] = []
-    private var cache: [String: (Date, [RemoteEntry])] = [:]
+    private var cache = DirectoryCache()
+    private let listingWorker = ListingWorker()
+    private var filtering = false
     private var icons: [String: NSImage] = [:]
     private var busy = false
     private var showHidden = false
     private var generation = UUID()
+    private var connectionMonitor: Timer?
+    private var reconnectWork: DispatchWorkItem?
     private let worker = DispatchQueue(label: "RemoteFinder.sftp", qos: .userInitiated)
     private var profiles: [ConnectionProfile] = []
     private var savedLocations = SavedLocation.load()
@@ -85,6 +140,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         super.init(window: window)
         if let data = UserDefaults.standard.data(forKey: "connections"), let saved = try? JSONDecoder().decode([ConnectionProfile].self, from: data) { profiles = saved }
         buildInterface()
+        _ = transfers
         window.center()
         updateControls()
     }
@@ -137,7 +193,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         forwardButton = button("前进：打开下一个目录", "chevron.right", #selector(goForward))
         upButton = button("上一级：打开父目录", "arrow.up", #selector(goUp))
         refreshButton = button("刷新当前目录（⌘R）", "arrow.clockwise", #selector(refresh))
-        stopButton = button("断开连接 / 取消当前操作", "xmark.circle", #selector(disconnect))
+        stopButton = button("断开目录浏览连接（后台传输请在传输面板停止）", "xmark.circle", #selector(disconnect))
         hiddenButton = button("显示隐藏文件（⇧⌘.）", "eye.slash", #selector(toggleHidden))
         bookmarkButton = button("收藏当前目录（⌘D）", "star", #selector(saveCurrentLocation))
         renameButton = button("重命名选中的远程文件或文件夹（Return）", "square.and.pencil", #selector(renameSelected))
@@ -181,13 +237,18 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.rowHeight = 26; table.intercellSpacing = NSSize(width: 8, height: 2)
         table.backgroundColor = .clear; table.usesAlternatingRowBackgroundColors = false; table.style = .inset
-        table.dataSource = self; table.delegate = self; table.target = self; table.doubleAction = #selector(openSelected)
+        table.dataSource = self; table.delegate = self; table.target = self; table.doubleAction = #selector(openClicked(_:))
         table.openSelection = { [weak self] in self?.openSelected() }
         table.renameSelection = { [weak self] in self?.renameSelected() }
         let menu = NSMenu()
         for (title, action) in [("打开", #selector(openSelected)), ("重命名…", #selector(renameSelected))] {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: ""); item.target = self
         }
+        table.registerForDraggedTypes([.fileURL])
+        table.allowsMultipleSelection = true
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
+        table.setDraggingSourceOperationMask([], forLocal: true)
+        table.toolTip = "将文件或文件夹拖到 Finder 或桌面下载（包含子目录）；将本地文件拖入这里上传。"
         table.menu = menu
         table.setAccessibilityLabel("远程文件")
         emptyLabel.alignment = .center; emptyLabel.textColor = .secondaryLabelColor; emptyLabel.font = .systemFont(ofSize: 14)
@@ -198,7 +259,15 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
 
         spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor; status.lineBreakMode = .byTruncatingMiddle
-        let footer = NSStackView(views: [spinner, status]); footer.orientation = .horizontal; footer.spacing = 8
+        transferButton = NSButton(title: "传输与编辑（0）", target: self, action: #selector(showTransfers))
+        transferButton.bezelStyle = .recessed; transferButton.toolTip = "查看上传进度、冲突、断点续传和本地编辑同步"
+        transferProgress.style = .bar; transferProgress.controlSize = .small
+        transferProgress.minValue = 0; transferProgress.maxValue = 100; transferProgress.isHidden = true
+        transferProgress.setAccessibilityLabel("后台传输进度，点击查看传输面板")
+        transferProgress.onClick = { [weak self] in self?.showTransfers() }
+        transferProgress.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [spinner, status, transferProgress, transferButton]); footer.orientation = .horizontal; footer.spacing = 8
         content.addSubview(footer); footer.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             backdrop.leadingAnchor.constraint(equalTo: root.leadingAnchor), backdrop.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -331,7 +400,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
     @objc private func manageSavedConnection(_ sender: NSButton) {
         let id = savedConnections[sender.tag].id.uuidString
         let menu = NSMenu()
-        for (title, action) in [("编辑连接 / 名称…", #selector(editSavedConnection(_:))), ("移除常用连接", #selector(removeSavedConnection(_:)))] {
+        for (title, action) in [("编辑连接 / 名称…", #selector(editSavedConnection(_:))), ("忘记已保存密码…", #selector(forgetSavedPassword(_:))), ("移除常用连接", #selector(removeSavedConnection(_:)))] {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: ""); item.target = self; item.representedObject = id
         }
         DispatchQueue.main.async { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY), in: sender) }
@@ -340,6 +409,31 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
     @objc private func editSavedConnection(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let item = savedConnections.first(where: { $0.id.uuidString == id }) else { return }
         showConnectionForm(existing: item)
+    }
+
+    @objc func forgetCurrentPassword() {
+        guard let connection = profile ?? profiles.first else { return }
+        forgetPassword(connection)
+    }
+
+    @objc private func forgetSavedPassword(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let item = savedConnections.first(where: { $0.id.uuidString == id }) else { return }
+        forgetPassword(item.connection)
+    }
+
+    private func forgetPassword(_ connection: ConnectionProfile) {
+        guard let window = window, window.attachedSheet == nil else { return }
+        let alert = NSAlert(); alert.messageText = "忘记已保存密码？"
+        alert.informativeText = "\(connection.label)\n删除此连接保存在 macOS 钥匙串中的密码，下次需要时重新输入。服务器密码和当前连接不会改变。"
+        alert.addButton(withTitle: "忘记密码").toolTip = "删除此连接的本地钥匙串密码"
+        alert.addButton(withTitle: "取消").toolTip = "保留已保存密码"
+        alert.beginSheetModal(for: window) { [weak self] result in
+            guard result == .alertFirstButtonReturn else { return }
+            do {
+                try SSHPasswordStore(profile: connection).forget()
+                self?.status.stringValue = "已忘记密码 · 下次需要时重新输入"
+            } catch { self?.showError(error.localizedDescription) }
+        }
     }
 
     @objc private func removeSavedConnection(_ sender: NSMenuItem) {
@@ -369,7 +463,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
 
     @objc private func openSavedLocation(_ sender: NSButton) {
         let connection = savedLocations[sender.tag].connection
-        if let current = profile, current.sameServer(as: connection), !path.isEmpty {
+        if let current = profile, current.sameServer(as: connection), client?.isUsable == true, !path.isEmpty {
             guard !busy else { return }
             navigate(connection.path)
         } else { connect(connection) }
@@ -416,11 +510,11 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
     }
 
     @objc func renameSelected() {
-        guard !busy, let session = client, let current = profile, visible.indices.contains(table.selectedRow) else { return }
+        guard !busy, !filtering, client?.isUsable == true, let current = profile, visible.indices.contains(table.selectedRow) else { return }
         let entry = visible[table.selectedRow]; let directory = path; let token = generation
         askName(title: "重命名远程项目", detail: "\(entry.name)\n会修改服务器上的名称；不会覆盖已有的同名项目。", value: entry.name, action: "重命名") { [weak self] name in
-            guard let self = self, self.generation == token, !self.busy, name != entry.name else { return }
-            self.run("正在重命名…") {
+            guard let self = self, self.generation == token, self.path == directory, !self.busy, name != entry.name else { return }
+            self.run("正在重命名…", mutation: true) { session in
                 try session.rename(in: directory, from: entry.name, to: name)
             } completion: { [weak self] _ in
                 guard let self = self else { return }
@@ -440,13 +534,9 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
                 self.home = replacingRemotePath(self.home, from: oldPath, to: newPath)
                 self.persistLocations(); self.saveConnection()
                 self.cache.removeAll(); self.entries.removeAll(); self.applyFilter()
-                self.run("已重命名，正在刷新目录…") { try session.list(directory) } completion: { [weak self] entries in
+                self.run("已重命名，正在刷新目录…", retryRead: true) { session in try session.list(directory) } completion: { [weak self] entries in
                     guard let self = self else { return }
-                    self.display(entries, at: directory)
-                    if let row = self.visible.firstIndex(where: { $0.name == name }) {
-                        self.table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-                        self.table.scrollRowToVisible(row)
-                    }
+                    self.display(entries, at: directory, selecting: name)
                     self.status.stringValue = "已重命名为“\(name)”"
                 }
             }
@@ -459,8 +549,8 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         guard let window = window, window.attachedSheet == nil else { return }
         let alert = NSAlert()
         alert.messageText = existing == nil ? "新建 SSH / SFTP 连接" : "编辑连接"
-        alert.informativeText = "支持 ~/.ssh/config 别名、密钥和 SSH agent。需要密码或验证码时会弹出输入框；密码不会保存。"
-        alert.addButton(withTitle: "保存并连接").toolTip = "保存配置并连接服务器，不保存密码"
+        alert.informativeText = "支持 ~/.ssh/config 别名、密钥和 SSH agent。输入密码时可选择保存到 macOS 钥匙串；验证码不保存。"
+        alert.addButton(withTitle: "保存并连接").toolTip = "保存连接配置并连接；可在认证时选择记住密码"
         alert.addButton(withTitle: "仅保存").toolTip = "保存到常用连接，暂不连接服务器"
         alert.addButton(withTitle: "取消").toolTip = "关闭连接表单"
         let previous = existing?.connection
@@ -499,7 +589,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         disconnect()
         client = session; profile = connection
         rebuildSidebar()
-        run("正在连接 \(connection.label)…") { () throws -> (String, String, [RemoteEntry]) in
+        run("正在连接 \(connection.label)…") { session -> (String, String, [RemoteEntry]) in
             try session.start()
             let home = try session.realpath(".")
             let initial = connection.path == "~" ? home : connection.path.hasPrefix("~/") ? home + String(connection.path.dropFirst()) : connection.path
@@ -507,112 +597,216 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
             return (home, resolved, try session.list(resolved))
         } completion: { [weak self] result in
             guard let self = self else { return }
+            self.startConnectionMonitor()
             self.home = result.0
+            self.cache.insert(result.2, at: result.1)
             self.display(result.2, at: result.1)
             self.saveConnection()
         }
     }
 
-    private func run<T>(_ message: String, operation: @escaping () throws -> T, completion: @escaping (T) -> Void) {
-        guard let session = client else { return }
+    private func startConnectionMonitor() {
+        connectionMonitor?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self = self, !self.busy, !self.path.isEmpty,
+                  let session = self.client, !session.isUsable else { return }
+            self.recoverConnection()
+        }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+        connectionMonitor = timer
+    }
+
+    // Only reads can be replayed. A lost rename response leaves its outcome unknown.
+    private func run<T>(_ message: String, retryRead: Bool = false, mutation: Bool = false, recoverOnFailure: Bool = true,
+                        operation: @escaping (SFTPClient) throws -> T, completion: @escaping (T) -> Void) {
+        guard let session = client, !busy else { return }
         let token = generation
         busy = true; status.stringValue = message; updateControls()
         if visible.isEmpty { emptyLabel.stringValue = message }
         worker.async {
             do {
-                let result = try operation()
+                let result = try operation(session)
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self, self.generation == token else { return }
                     self.busy = false; completion(result); self.updateControls()
                 }
             } catch {
-                let message = session.diagnosticMessage(error)
+                let detail = session.diagnosticMessage(error)
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self, self.generation == token else { return }
                     self.busy = false
-                    self.status.stringValue = "操作失败 · 可重试或重新连接"
-                    self.updateControls(); self.showError(message)
+                    if !session.isUsable && !self.path.isEmpty {
+                        guard recoverOnFailure else {
+                            self.connectionMonitor?.invalidate(); self.connectionMonitor = nil
+                            self.cache.removeAll()
+                            self.status.stringValue = "网络仍不稳定 · 点击刷新重新连接"
+                            self.updateControls(); self.showError(detail); return
+                        }
+                        self.recoverConnection(resume: retryRead ? { [weak self] in
+                            self?.run(message, recoverOnFailure: false, operation: operation, completion: completion)
+                        } : nil)
+                        if mutation { self.showError("重命名结果未确认，恢复连接后请检查目录，避免重复操作。\n\n" + detail) }
+                        else if !retryRead { self.showError(detail) }
+                        return
+                    }
+                    if self.path.isEmpty { self.disconnect() }
+                    self.status.stringValue = self.client == nil ? "连接已断开 · 请从侧边栏重新连接" : "操作失败 · 可以重试"
+                    self.updateControls(); self.showError(detail)
                 }
             }
         }
+    }
+
+    private func recoverConnection(attempt: Int = 0, resume: (() -> Void)? = nil) {
+        guard let connection = profile, !path.isEmpty else { return }
+        connectionMonitor?.invalidate(); connectionMonitor = nil
+        reconnectWork?.cancel(); client?.cancel(); cache.removeAll()
+        let delays: [TimeInterval] = [1, 2, 4, 8, 16]
+        guard attempt < delays.count else {
+            busy = false
+            status.stringValue = "自动重连未成功 · 点击刷新或最近连接，重新认证"
+            status.toolTip = "网络恢复后可点击刷新（⌘R）。已保存密码无法使用、或服务器需要验证码 / 私钥口令时，请手动完成认证。"
+            updateControls(); return
+        }
+        let token = generation
+        let directory = path
+        busy = true
+        status.stringValue = "连接中断 · \(Int(delays[attempt])) 秒后自动重连（\(attempt + 1)/\(delays.count)）"
+        updateControls()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.generation == token else { return }
+            let session: SFTPClient
+            do {
+                let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+                let helper = executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/askpass")
+                session = try SFTPClient(profile: connection, askpass: helper.path, interactive: false)
+            } catch {
+                self.busy = false; self.status.stringValue = error.localizedDescription; self.updateControls(); return
+            }
+            self.client = session
+            self.status.stringValue = "正在自动重连（\(attempt + 1)/\(delays.count)）…"
+            self.worker.async {
+                do {
+                    try session.start()
+                    let home = try session.realpath(".")
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.generation == token else { return }
+                        self.busy = false; self.home = home; self.status.toolTip = nil
+                        self.startConnectionMonitor(); self.updateControls()
+                        if let resume = resume { resume() }
+                        else {
+                            self.run("连接已恢复，正在刷新目录…", recoverOnFailure: false) { try $0.list(directory) } completion: { [weak self] contents in
+                                guard let self = self else { return }
+                                self.entries = contents; self.cache.insert(contents, at: directory)
+                                self.applyFilter()
+                            }
+                        }
+                    }
+                } catch {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.generation == token else { return }
+                        // A failed saved-password attempt may be a bad password or MFA; avoid account lockouts.
+                        if session.usedSavedPassword {
+                            self.busy = false
+                            self.status.stringValue = "已保存密码未能完成认证 · 点击刷新手动连接"
+                            self.updateControls()
+                        } else { self.recoverConnection(attempt: attempt + 1, resume: resume) }
+                    }
+                }
+            }
+        }
+        reconnectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delays[attempt], execute: work)
     }
 
     private func saveConnection() {
         guard var connection = profile else { return }
         connection.path = path
-        profiles.removeAll { $0.host == connection.host && $0.user == connection.user && $0.port == connection.port }
-        profiles.insert(connection, at: 0); profiles = Array(profiles.prefix(10))
+        let updated = [connection] + profiles.filter { !$0.sameServer(as: connection) }.prefix(9)
+        guard updated != profiles else { return }
+        profiles = updated
         if let data = try? JSONEncoder().encode(profiles) { UserDefaults.standard.set(data, forKey: "connections") }
         rebuildSidebar()
     }
 
     private func navigate(_ destination: String, history: Int = 0, force: Bool = false) {
-        guard let session = client, !busy else { return }
+        guard client != nil, !busy else { return }
         let target = destination == "~" ? home : destination.hasPrefix("~/") ? home + String(destination.dropFirst()) : destination.hasPrefix("/") ? destination : childPath(destination)
         func commit(_ resolved: String, _ contents: [RemoteEntry]) {
             if history == -1 { _ = backHistory.popLast(); forwardHistory.append(path) }
             else if history == 1 { _ = forwardHistory.popLast(); backHistory.append(path) }
             else if resolved != path && !path.isEmpty { backHistory.append(path); forwardHistory.removeAll() }
+            if backHistory.count > 200 { backHistory.removeFirst(backHistory.count - 200) }
+            if forwardHistory.count > 200 { forwardHistory.removeFirst(forwardHistory.count - 200) }
             display(contents, at: resolved); saveConnection()
         }
-        if !force, let cached = cache[target], Date().timeIntervalSince(cached.0) < 15 {
-            commit(target, cached.1); cache[target] = cached; updateControls(); return
+        if !force, let cached = cache.get(target) {
+            commit(target, cached); updateControls(); return
         }
-        run("正在读取文件夹…") { () throws -> (String, [RemoteEntry]) in
+        run("正在读取文件夹…", retryRead: true) { session -> (String, [RemoteEntry]) in
             let resolved = try session.realpath(target)
             return (resolved, try session.list(resolved))
-        } completion: { result in commit(result.0, result.1) }
+        } completion: { result in
+            self.cache.insert(result.1, at: result.0)
+            commit(result.0, result.1)
+        }
     }
 
     private func childPath(_ name: String) -> String { (path == "/" ? "/" : path + "/") + name }
-    private func display(_ contents: [RemoteEntry], at resolved: String) {
+    private func display(_ contents: [RemoteEntry], at resolved: String, selecting name: String? = nil) {
+        if path != resolved { table.deselectAll(nil); visible.removeAll(); table.reloadData() }
         path = resolved; profile?.path = resolved; entries = contents; pathBar.setPath(resolved)
         folderTitle.stringValue = resolved == "/" ? "/" : (resolved as NSString).lastPathComponent
         folderSubtitle.stringValue = profile?.label ?? ""
-        if cache.count >= 32 { cache.removeAll() }
-        cache[resolved] = (Date(), contents)
         window?.title = "\((resolved as NSString).lastPathComponent.isEmpty ? "/" : (resolved as NSString).lastPathComponent) — RemoteFinder"
-        search.stringValue = ""; applyFilter()
+        search.stringValue = ""; applyFilter(selecting: name)
     }
-    private func applyFilter() {
-        visible = entries.filter { (showHidden || !$0.name.hasPrefix(".")) && (search.stringValue.isEmpty || $0.name.localizedCaseInsensitiveContains(search.stringValue)) }
-        if let descriptor = table.sortDescriptors.first {
-            visible.sort { left, right in
-                if left.attributes.isDirectory != right.attributes.isDirectory { return left.attributes.isDirectory }
-                let result: ComparisonResult
-                switch descriptor.key {
-                case "size": result = NSNumber(value: left.attributes.size ?? 0).compare(NSNumber(value: right.attributes.size ?? 0))
-                case "date": result = (left.attributes.modified ?? .distantPast).compare(right.attributes.modified ?? .distantPast)
-                default: result = left.name.localizedStandardCompare(right.name)
-                }
-                if result == .orderedSame { return left.name.localizedStandardCompare(right.name) == .orderedAscending }
-                return descriptor.ascending ? result == .orderedAscending : result == .orderedDescending
-            }
+    private func applyFilter(delay: TimeInterval = 0, selecting name: String? = nil) {
+        let selected = name ?? (visible.indices.contains(table.selectedRow) ? visible[table.selectedRow].name : nil)
+        listingWorker.cancel()
+        guard !entries.isEmpty else { filtering = false; showListing([], selecting: nil); return }
+        filtering = true; updateControls()
+        if !busy && client?.isUsable == true { status.stringValue = "正在筛选和排序…" }
+        let descriptor = table.sortDescriptors.first
+        listingWorker.submit(entries, query: search.stringValue, showHidden: showHidden,
+                             key: descriptor?.key ?? "name", ascending: descriptor?.ascending ?? true, delay: delay) { [weak self] result in
+            guard let self = self else { return }
+            self.filtering = false; self.showListing(result, selecting: selected)
         }
-        table.reloadData()
+    }
+    private func showListing(_ contents: [RemoteEntry], selecting name: String?) {
+        table.deselectAll(nil)
+        visible = contents; table.reloadData()
+        if let name = name, let row = visible.firstIndex(where: { $0.name == name }) {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table.scrollRowToVisible(row)
+        }
         emptyLabel.isHidden = !visible.isEmpty
         emptyIcon.isHidden = !visible.isEmpty
         emptyLabel.stringValue = client == nil ? "你的远程文件，就在这里。\n\n点击“连接服务器”或按 ⌘K\n双击文件夹浏览，双击文件用本地应用打开。" : busy ? "正在读取…" : "当前文件夹没有可显示的文件"
-        if !busy && client != nil { status.stringValue = "\(visible.count) 项 · 双击打开 · 本地修改不会上传" }
+        if !busy && client?.isUsable == true { status.stringValue = "\(visible.count) 项 · 双击打开 · UTF-8 文本保存后自动同步" }
         updateControls()
     }
     private func updateControls() {
-        let ready = client != nil && !busy && !path.isEmpty
+        let ready = client?.isUsable == true && !busy && !path.isEmpty
         backButton.isEnabled = ready && !backHistory.isEmpty
         forwardButton.isEnabled = ready && !forwardHistory.isEmpty
         upButton.isEnabled = ready && path != "/"
-        refreshButton.isEnabled = ready; pathBar.isEnabled = ready
-        renameButton.isEnabled = ready && visible.indices.contains(table.selectedRow)
+        refreshButton.isEnabled = profile != nil && !busy; pathBar.isEnabled = ready
+        renameButton.isEnabled = ready && !filtering && visible.indices.contains(table.selectedRow)
         bookmarkButton.isEnabled = ready
         let saved = profile.map { current in savedLocations.contains { $0.connection.sameServer(as: current) && $0.connection.path == path } } ?? false
         bookmarkButton.image = NSImage(systemSymbolName: saved ? "star.fill" : "star", accessibilityDescription: nil)
         bookmarkButton.contentTintColor = teal
         bookmarkButton.toolTip = saved ? "当前目录已收藏，点击修改收藏名称（⌘D）" : "收藏当前目录（⌘D）"
         stopButton.isEnabled = client != nil
-        if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        if busy || filtering { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
     }
 
     @objc func disconnect() {
+        connectionMonitor?.invalidate(); connectionMonitor = nil
+        reconnectWork?.cancel(); reconnectWork = nil; status.toolTip = nil
         generation = UUID(); client?.cancel(); client = nil; profile = nil; busy = false
         path = ""; home = ""; entries.removeAll(); cache.removeAll(); backHistory.removeAll(); forwardHistory.removeAll()
         pathBar.setPath(""); search.stringValue = ""
@@ -620,7 +814,11 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         folderTitle.stringValue = "远程文件"; folderSubtitle.stringValue = "连接你的服务器，像本地一样浏览。"
         rebuildSidebar(); applyFilter(); updateControls()
     }
-    @objc func refresh() { navigate(path, force: true) }
+    @objc func refresh() {
+        guard !busy else { return }
+        if client?.isUsable != true, let connection = profile { connect(connection) }
+        else { navigate(path, force: true) }
+    }
     @objc func focusPath() { pathBar.beginEditing() }
     @objc private func goBack() { if let target = backHistory.last { navigate(target, history: -1) } }
     @objc private func goForward() { if let target = forwardHistory.last { navigate(target, history: 1) } }
@@ -632,25 +830,88 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         applyFilter()
     }
 
-    @objc func openSelected() {
-        guard !busy, let session = client, visible.indices.contains(table.selectedRow) else { return }
-        let entry = visible[table.selectedRow]; let remote = childPath(entry.name)
+    @objc func showTransfers() {
+        if transferWindow == nil {
+            let panel = TransferWindow(); panel.items = transferItems
+            panel.action = { [weak self] id, action in self?.transfers.action(id, action) }
+            transferWindow = panel
+        }
+        transferWindow?.showWindow(nil); transferWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+    @objc func chooseUploads() {
+        guard let connection = profile, !path.isEmpty else { return }
+        let directory = path
+        let panel = NSOpenPanel(); panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
+        panel.beginSheetModal(for: window!) { [weak self] result in
+            if result == .OK { self?.transfers.add(panel.urls, connection: connection, directory: directory) }
+        }
+    }
+    func stopTransfers() { transfers.shutdown() }
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard !busy, !filtering, let connection = profile, visible.indices.contains(row),
+              visible[row].attributes.isRegular || visible[row].attributes.isDirectory,
+              RemoteEntry.isSafeName(visible[row].name) else { return nil }
+        let entry = visible[row]
+        let type = entry.attributes.isDirectory ? UTType.folder : (UTType(filenameExtension: (entry.name as NSString).pathExtension) ?? .data)
+        let provider = NSFilePromiseProvider(fileType: type.conforms(to: .data) || type.conforms(to: .directory) ? type.identifier : UTType.data.identifier, delegate: self)
+        provider.userInfo = PromisedDownload(connection: connection, remote: childPath(entry.name), transfers: transfers)
+        return provider
+    }
+    func filePromiseProvider(_ provider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+        ((provider.userInfo as! PromisedDownload).remote as NSString).lastPathComponent
+    }
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue { promiseQueue }
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        // A cancelled drag has no receiver; don't leave file promises waiting at app exit.
+        if operation.isEmpty { session.draggingPasteboard.clearContents() }
+    }
+    func filePromiseProvider(_ provider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
+        guard let download = provider.userInfo as? PromisedDownload else {
+            completionHandler(RemoteError("下载来源已失效，请重新拖出文件。")); return
+        }
+        do {
+            try download.transfers.download(download.remote, connection: download.connection, to: url)
+            completionHandler(nil)
+        } catch { completionHandler(error) }
+    }
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
+        guard profile != nil, !path.isEmpty, !busy, !filtering else { return [] }
+        let folder = visible.indices.contains(row) && visible[row].attributes.isDirectory
+        tableView.setDropRow(folder ? row : -1, dropOperation: folder ? .on : .above)
+        status.stringValue = "上传到：" + (folder ? childPath(visible[row].name) : path)
+        return .copy
+    }
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        guard let connection = profile, !path.isEmpty, !busy, !filtering,
+              let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { return false }
+        let directory = visible.indices.contains(row) && visible[row].attributes.isDirectory ? childPath(visible[row].name) : path
+        transfers.add(urls, connection: connection, directory: directory); return true
+    }
+
+    @objc private func openClicked(_ sender: NSTableView) { open(row: sender.clickedRow) }
+    @objc func openSelected() { open(row: table.selectedRow) }
+    private func open(row: Int) {
+        guard !busy, !filtering, client?.isUsable == true, visible.indices.contains(row) else { return }
+        let entry = visible[row]; let remote = childPath(entry.name)
         if entry.attributes.isDirectory { navigate(remote); return }
+        if let current = profile, let editing = transferItems.first(where: { $0.editing && $0.state != "stopped" && $0.connection.sameServer(as: current) && $0.remote == remote }) {
+            NSWorkspace.shared.open(editing.local); return
+        }
         if entry.attributes.isLink || entry.attributes.permissions == nil {
-            run("正在读取链接…") { try session.stat(remote) } completion: { [weak self] attributes in
+            run("正在读取链接…", retryRead: true) { session in try session.stat(remote) } completion: { [weak self] attributes in
                 if attributes.isDirectory { self?.navigate(remote) } else { self?.download(remote, name: entry.name) }
             }
         } else { download(remote, name: entry.name) }
     }
 
     private func download(_ remote: String, name: String) {
-        guard let session = client else { return }
+        guard client != nil, let connection = profile else { return }
         let token = generation
-        run("正在下载 \(name)…") { () throws -> URL in
+        run("正在下载 \(name)…", retryRead: true) { session -> (URL, String?) in
             let root = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                 .appendingPathComponent("RemoteFinder", isDirectory: true).appendingPathComponent(UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let local = root.appendingPathComponent(name)
+            var local = root.appendingPathComponent(name)
             var lastUpdate = Date.distantPast
             do {
                 try session.download(remote, to: local) { completed, total in
@@ -661,15 +922,23 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
                     }
                 }
             } catch { try? FileManager.default.removeItem(at: root); throw error }
-            // Treat remote downloads like other untrusted downloads, including executables.
-            let quarantine = "0081;\(String(Int(Date().timeIntervalSince1970), radix: 16));RemoteFinder;\(UUID().uuidString)"
-            let result = local.path.withCString { path in quarantine.withCString { value in
-                setxattr(path, "com.apple.quarantine", value, strlen(value), 0, 0)
-            } }
-            guard result == 0 else { throw RemoteError("文件已下载，但无法设置 macOS 下载安全标记；未自动打开。") }
-            return local
-        } completion: { [weak self] local in
-            if NSWorkspace.shared.open(local) { self?.status.stringValue = "已在本地打开 \(name) · 修改不会上传" }
+            var baseline: String?
+            if try isEditableText(local), try session.attributesIfPresent(remote)?.isRegular == true {
+                baseline = try localFingerprint(local)
+                let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RemoteFinder/Editing").appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let workingCopy = folder.appendingPathComponent(name)
+                try FileManager.default.moveItem(at: local, to: workingCopy); local = workingCopy
+            }
+            return (local, baseline)
+        } completion: { [weak self] result in
+            let local = result.0
+            if NSWorkspace.shared.open(local) {
+                if let baseline = result.1 {
+                    self?.transfers.watch(local, connection: connection, remote: remote, baseline: baseline)
+                    self?.status.stringValue = "已打开 \(name) · 本地保存后自动同步"
+                } else { self?.status.stringValue = "已在本地打开 \(name) · 此文件不自动同步" }
+            }
             else { self?.showError("没有应用能够打开这个文件。缓存位置：\(local.path)") }
         }
     }
@@ -681,7 +950,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
         alert.addButton(withTitle: "好").toolTip = "关闭此提示"
         alert.beginSheetModal(for: window)
     }
-    func controlTextDidChange(_ obj: Notification) { applyFilter() }
+    func controlTextDidChange(_ obj: Notification) { applyFilter(delay: 0.12) }
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
     func tableViewSelectionDidChange(_ notification: Notification) { updateControls() }
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { FileRow() }
@@ -707,6 +976,7 @@ final class BrowserController: NSWindowController, NSTableViewDataSource, NSTabl
             cell.textField?.stringValue = entry.name
             let key = entry.attributes.isDirectory ? "__folder" : entry.attributes.isLink ? "__link" : (entry.name as NSString).pathExtension
             if icons[key] == nil {
+                if icons.count >= 256 { icons.removeAll() }
                 icons[key] = entry.attributes.isDirectory ? NSImage(systemSymbolName: "folder.fill", accessibilityDescription: "文件夹") : entry.attributes.isLink ? NSImage(systemSymbolName: "link", accessibilityDescription: "符号链接") : NSWorkspace.shared.icon(forFileType: key)
             }
             cell.imageView?.image = icons[key]
